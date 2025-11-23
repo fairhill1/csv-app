@@ -1008,9 +1008,7 @@ impl eframe::App for SpreadsheetApp {
                                             // Track drag end cell for later update (avoid flicker)
                                             if self.drag_start.is_some() && ui.input(|i| i.pointer.primary_down()) {
                                                 if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                                                    // Expand rect to handle edge cases (dividers, fast dragging)
-                                                    let expanded_rect = rect.expand(5.0);
-                                                    if expanded_rect.contains(pos) {
+                                                    if rect.contains(pos) {
                                                         drag_end_cell = Some(cell_id);
                                                     }
                                                 }

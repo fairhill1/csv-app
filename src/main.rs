@@ -11,6 +11,14 @@ enum Selection {
     Row(usize),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum PendingAction {
+    None,
+    NewFile,
+    OpenFile,
+    Exit,
+}
+
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -37,7 +45,8 @@ struct SpreadsheetApp {
     clipboard: arboard::Clipboard,
     undo_stack: Vec<Vec<Vec<String>>>,
     redo_stack: Vec<Vec<Vec<String>>>,
-    show_new_file_confirm: bool,
+    pending_action: PendingAction,
+    has_unsaved_changes: bool,
     table_id_salt: u64, // Change this to reset table state
     dark_mode: bool,
 }
@@ -56,7 +65,8 @@ impl Default for SpreadsheetApp {
             clipboard: arboard::Clipboard::new().unwrap(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
-            show_new_file_confirm: false,
+            pending_action: PendingAction::None,
+            has_unsaved_changes: false,
             table_id_salt: 0,
             dark_mode: true, // Default to dark mode
         }
@@ -148,6 +158,7 @@ impl SpreadsheetApp {
                 // Normalize immediately to ensure rectangular structure
                 self.normalize_data();
                 self.file_path = Some(path);
+                self.has_unsaved_changes = false;
             }
             Err(e) => {
                 eprintln!("Error loading CSV: {}", e);
@@ -169,6 +180,7 @@ impl SpreadsheetApp {
     fn add_row(&mut self) {
         let cols = self.data.first().map(|r| r.len()).unwrap_or(10);
         self.data.push(vec![String::new(); cols]);
+        self.has_unsaved_changes = true;
     }
 
     fn add_column(&mut self) {
@@ -179,11 +191,13 @@ impl SpreadsheetApp {
                 row.push(String::new());
             }
         }
+        self.has_unsaved_changes = true;
     }
 
     fn insert_row_at(&mut self, row_idx: usize) {
         let cols = self.data.first().map(|r| r.len()).unwrap_or(10);
         self.data.insert(row_idx, vec![String::new(); cols]);
+        self.has_unsaved_changes = true;
 
         // Adjust editing cell index if after inserted row
         if let Some((editing_row, editing_col)) = self.editing_cell {
@@ -201,6 +215,7 @@ impl SpreadsheetApp {
                 row.insert(col_idx, String::new());
             }
         }
+        self.has_unsaved_changes = true;
 
         // Adjust editing cell index if after inserted column
         if let Some((editing_row, editing_col)) = self.editing_cell {
@@ -224,6 +239,7 @@ impl SpreadsheetApp {
     fn delete_row(&mut self, row_idx: usize) {
         if row_idx < self.data.len() {
             self.data.remove(row_idx);
+            self.has_unsaved_changes = true;
             // Clear editing state if we're editing the deleted row
             if let Some((editing_row, _)) = self.editing_cell {
                 if editing_row == row_idx {
@@ -242,6 +258,7 @@ impl SpreadsheetApp {
                 row.remove(col_idx);
             }
         }
+        self.has_unsaved_changes = true;
         // Clear editing state if we're editing the deleted column
         if let Some((editing_row, editing_col)) = self.editing_cell {
             if editing_col == col_idx {
@@ -268,6 +285,7 @@ impl SpreadsheetApp {
     fn save_undo_state(&mut self) {
         self.undo_stack.push(self.data.clone());
         self.redo_stack.clear();
+        self.has_unsaved_changes = true;
         // Limit undo stack to 50 entries
         if self.undo_stack.len() > 50 {
             self.undo_stack.remove(0);
@@ -278,6 +296,7 @@ impl SpreadsheetApp {
         if let Some(prev_state) = self.undo_stack.pop() {
             self.redo_stack.push(self.data.clone());
             self.data = prev_state;
+            self.has_unsaved_changes = true;
         }
     }
 
@@ -285,6 +304,7 @@ impl SpreadsheetApp {
         if let Some(next_state) = self.redo_stack.pop() {
             self.undo_stack.push(self.data.clone());
             self.data = next_state;
+            self.has_unsaved_changes = true;
         }
     }
 
@@ -405,6 +425,35 @@ impl SpreadsheetApp {
 
 impl eframe::App for SpreadsheetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Intercept close requests to show confirmation modal
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if self.has_unsaved_changes && self.pending_action != PendingAction::Exit {
+                // Prevent close and show confirmation modal
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.pending_action = PendingAction::Exit;
+            }
+            // If no unsaved changes or user confirmed, allow the window to close
+        }
+
+        // Update window title to show filename and unsaved changes indicator
+        let title = if let Some(ref path) = self.file_path {
+            let filename = path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("Untitled");
+            if self.has_unsaved_changes {
+                format!("GridView - {} *", filename)
+            } else {
+                format!("GridView - {}", filename)
+            }
+        } else {
+            if self.has_unsaved_changes {
+                "GridView *".to_string()
+            } else {
+                "GridView".to_string()
+            }
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+
         // Apply theme
         if self.dark_mode {
             ctx.set_visuals(egui::Visuals::dark());
@@ -544,16 +593,27 @@ impl eframe::App for SpreadsheetApp {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("New").clicked() {
-                        self.show_new_file_confirm = true;
+                        if self.has_unsaved_changes {
+                            self.pending_action = PendingAction::NewFile;
+                        } else {
+                            // No unsaved changes, create new file directly
+                            self.data = vec![vec![String::new(); 10]; 20];
+                            self.file_path = None;
+                        }
                         ui.close();
                     }
 
                     if ui.button("Open CSV").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("CSV", &["csv"])
-                            .pick_file()
-                        {
-                            self.load_csv(path);
+                        if self.has_unsaved_changes {
+                            self.pending_action = PendingAction::OpenFile;
+                        } else {
+                            // No unsaved changes, open file directly
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("CSV", &["csv"])
+                                .pick_file()
+                            {
+                                self.load_csv(path);
+                            }
                         }
                         ui.close();
                     }
@@ -562,6 +622,8 @@ impl eframe::App for SpreadsheetApp {
                         if let Some(ref path) = self.file_path {
                             if let Err(e) = self.save_csv(path) {
                                 eprintln!("Error saving CSV: {}", e);
+                            } else {
+                                self.has_unsaved_changes = false;
                             }
                         }
                         ui.close();
@@ -576,6 +638,7 @@ impl eframe::App for SpreadsheetApp {
                                 eprintln!("Error saving CSV: {}", e);
                             } else {
                                 self.file_path = Some(path);
+                                self.has_unsaved_changes = false;
                             }
                         }
                         ui.close();
@@ -639,7 +702,7 @@ impl eframe::App for SpreadsheetApp {
             let row_height = 25.0;
 
             // Wrap everything in add_enabled_ui to disable interaction when modal is open
-            ui.add_enabled_ui(!self.show_new_file_confirm, |ui| {
+            ui.add_enabled_ui(self.pending_action == PendingAction::None, |ui| {
                 // Wrap in ScrollArea for horizontal scrolling
                 egui::ScrollArea::both()
                     .auto_shrink([false; 2])
@@ -660,6 +723,7 @@ impl eframe::App for SpreadsheetApp {
                         let mut insert_row_at: Option<usize> = None;
                         let mut insert_col_at: Option<usize> = None;
                         let mut drag_end_cell: Option<(usize, usize)> = None;
+                        let mut clear_cell: Option<(usize, usize)> = None;
 
                         let mut table = TableBuilder::new(ui)
                 .id_salt(self.table_id_salt) // Use salt to reset table state
@@ -852,6 +916,7 @@ impl eframe::App for SpreadsheetApp {
 
                                             if edit_response.lost_focus() || enter_pressed {
                                                 *cell_val = self.edit_buffer.clone();
+                                                self.has_unsaved_changes = true;
                                                 self.editing_cell = None;
                                             }
 
@@ -896,8 +961,24 @@ impl eframe::App for SpreadsheetApp {
                                             }
 
                                             response.context_menu(|ui| {
+                                                if ui.button("Cut").clicked() {
+                                                    self.cut_selection();
+                                                    ui.close();
+                                                }
+                                                if ui.button("Copy").clicked() {
+                                                    self.copy_selection();
+                                                    ui.close();
+                                                }
+                                                if ui.button("Paste").clicked() {
+                                                    if let Ok(text) = self.clipboard.get_text() {
+                                                        self.save_undo_state();
+                                                        self.paste_text(&text);
+                                                    }
+                                                    ui.close();
+                                                }
+                                                ui.separator();
                                                 if ui.button("Clear").clicked() {
-                                                    cell_val.clear();
+                                                    clear_cell = Some(cell_id);
                                                     ui.close();
                                                 }
                                             });
@@ -914,6 +995,7 @@ impl eframe::App for SpreadsheetApp {
                     if let Some(row_data) = self.data.get_mut(edit_row) {
                         if let Some(edit_cell) = row_data.get_mut(edit_col) {
                             *edit_cell = self.edit_buffer.clone();
+                            self.has_unsaved_changes = true;
                         }
                     }
                 }
@@ -945,6 +1027,14 @@ impl eframe::App for SpreadsheetApp {
             }
             if let Some(row_idx) = delete_row {
                 self.delete_row(row_idx);
+            }
+            if let Some((row_idx, col_idx)) = clear_cell {
+                self.save_undo_state();
+                if let Some(row_data) = self.data.get_mut(row_idx) {
+                    if let Some(cell) = row_data.get_mut(col_idx) {
+                        cell.clear();
+                    }
+                }
             }
 
             // Clear drag state when mouse released
@@ -986,30 +1076,70 @@ impl eframe::App for SpreadsheetApp {
             }); // End of add_enabled_ui
         });
 
-        // Draw modal window
-        if self.show_new_file_confirm {
+        // Draw unified confirmation modal
+        if self.pending_action != PendingAction::None {
             // Check for Escape key to close modal
             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                self.show_new_file_confirm = false;
+                self.pending_action = PendingAction::None;
             }
 
-            egui::Window::new("Confirm New File")
+            let (title, message, confirm_label) = match &self.pending_action {
+                PendingAction::NewFile => (
+                    "Confirm New File",
+                    "Are you sure you want to create a new file?",
+                    "Yes, create new file"
+                ),
+                PendingAction::OpenFile => (
+                    "Confirm Open File",
+                    "Are you sure you want to open a file?",
+                    "Yes, open file"
+                ),
+                PendingAction::Exit => (
+                    "Confirm Exit",
+                    "Are you sure you want to exit?",
+                    "Yes, exit"
+                ),
+                PendingAction::None => ("", "", ""),
+            };
+
+            egui::Window::new(title)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui.label("Are you sure you want to create a new file?");
+                    ui.label(message);
                     ui.label("All unsaved changes will be lost.");
                     ui.add_space(10.0);
 
                     ui.horizontal(|ui| {
-                        if ui.button("Yes, create new file").clicked() {
-                            self.data = vec![vec![String::new(); 10]; 20];
-                            self.file_path = None;
-                            self.show_new_file_confirm = false;
+                        if ui.button(confirm_label).clicked() {
+                            match self.pending_action {
+                                PendingAction::NewFile => {
+                                    self.data = vec![vec![String::new(); 10]; 20];
+                                    self.file_path = None;
+                                    self.has_unsaved_changes = false;
+                                    self.pending_action = PendingAction::None;
+                                }
+                                PendingAction::OpenFile => {
+                                    if let Some(path) = rfd::FileDialog::new()
+                                        .add_filter("CSV", &["csv"])
+                                        .pick_file()
+                                    {
+                                        self.load_csv(path);
+                                    }
+                                    self.pending_action = PendingAction::None;
+                                }
+                                PendingAction::Exit => {
+                                    // Clear unsaved flag so the next close attempt succeeds
+                                    self.has_unsaved_changes = false;
+                                    self.pending_action = PendingAction::None;
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                }
+                                PendingAction::None => {}
+                            }
                         }
                         if ui.button("Cancel").clicked() {
-                            self.show_new_file_confirm = false;
+                            self.pending_action = PendingAction::None;
                         }
                     });
                 });

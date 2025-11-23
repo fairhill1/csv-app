@@ -39,6 +39,7 @@ struct SpreadsheetApp {
     redo_stack: Vec<Vec<Vec<String>>>,
     show_new_file_confirm: bool,
     table_id_salt: u64, // Change this to reset table state
+    dark_mode: bool,
 }
 
 impl Default for SpreadsheetApp {
@@ -57,6 +58,7 @@ impl Default for SpreadsheetApp {
             redo_stack: Vec::new(),
             show_new_file_confirm: false,
             table_id_salt: 0,
+            dark_mode: true, // Default to dark mode
         }
     }
 }
@@ -403,6 +405,13 @@ impl SpreadsheetApp {
 
 impl eframe::App for SpreadsheetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Apply theme
+        if self.dark_mode {
+            ctx.set_visuals(egui::Visuals::dark());
+        } else {
+            ctx.set_visuals(egui::Visuals::light());
+        }
+
         // Handle keyboard input - check shortcuts early before any UI
         let not_editing = self.editing_cell.is_none();
 
@@ -609,6 +618,14 @@ impl eframe::App for SpreadsheetApp {
                     if ui.button("Reset Column Widths").clicked() {
                         self.column_widths.clear();
                         self.table_id_salt += 1; // Change table ID to reset egui's internal state
+                        ui.close();
+                    }
+
+                    ui.separator();
+
+                    let theme_label = if self.dark_mode { "Light Mode" } else { "Dark Mode" };
+                    if ui.button(theme_label).clicked() {
+                        self.dark_mode = !self.dark_mode;
                         ui.close();
                     }
                 });

@@ -38,6 +38,7 @@ struct SpreadsheetApp {
     undo_stack: Vec<Vec<Vec<String>>>,
     redo_stack: Vec<Vec<Vec<String>>>,
     show_new_file_confirm: bool,
+    table_id_salt: u64, // Change this to reset table state
 }
 
 impl Default for SpreadsheetApp {
@@ -55,6 +56,7 @@ impl Default for SpreadsheetApp {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             show_new_file_confirm: false,
+            table_id_salt: 0,
         }
     }
 }
@@ -602,11 +604,35 @@ impl eframe::App for SpreadsheetApp {
                         ui.close();
                     }
                 });
+
+                ui.menu_button("View", |ui| {
+                    if ui.button("Reset Column Widths").clicked() {
+                        self.column_widths.clear();
+                        self.table_id_salt += 1; // Change table ID to reset egui's internal state
+                        ui.close();
+                    }
+                });
             });
         });
 
-        // Show confirmation dialog for new file
+        // Show confirmation dialog for new file with dimmed background
         if self.show_new_file_confirm {
+            // Dim the background
+            egui::Area::new("modal_overlay".into())
+                .fixed_pos(egui::pos2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    let screen_rect = ctx.input(|i| {
+                        i.viewport().inner_rect.unwrap_or_else(|| {
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(10000.0, 10000.0))
+                        })
+                    });
+                    ui.painter().rect_filled(
+                        screen_rect,
+                        0.0,
+                        egui::Color32::from_black_alpha(128)
+                    );
+                });
+
             egui::Window::new("Confirm New File")
                 .collapsible(false)
                 .resizable(false)
@@ -629,10 +655,16 @@ impl eframe::App for SpreadsheetApp {
                 });
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        // Only show main UI if modal is not open
+        if !self.show_new_file_confirm {
+            egui::CentralPanel::default().show(ctx, |ui| {
             let num_rows = self.data.len();
             let num_cols = self.data.iter().map(|r| r.len()).max().unwrap_or(0);
             let row_height = 25.0;
+
+            // Track if we should save current edit when clicking away
+            let mut save_current_edit = false;
+            let previous_editing_cell = self.editing_cell; // Capture BEFORE we change it
 
             // Clone selection for use in closures (before any updates)
             let current_selection = self.selection.clone();
@@ -645,6 +677,7 @@ impl eframe::App for SpreadsheetApp {
             let mut drag_end_cell: Option<(usize, usize)> = None;
 
             let mut table = TableBuilder::new(ui)
+                .id_salt(self.table_id_salt) // Use salt to reset table state
                 .striped(true)
                 .resizable(true)
                 .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
@@ -825,6 +858,7 @@ impl eframe::App for SpreadsheetApp {
 
                                             // Double-click to edit
                                             if response.double_clicked() {
+                                                save_current_edit = true;
                                                 self.editing_cell = Some(cell_id);
                                                 self.edit_buffer = cell_val.clone();
                                                 self.selection = Selection::None;
@@ -832,6 +866,7 @@ impl eframe::App for SpreadsheetApp {
                                             }
                                             // Start drag selection
                                             else if response.is_pointer_button_down_on() {
+                                                save_current_edit = true;
                                                 self.drag_start = Some(cell_id);
                                                 self.selection = Selection::CellRange { start: cell_id, end: cell_id };
                                                 self.editing_cell = None;
@@ -860,6 +895,17 @@ impl eframe::App for SpreadsheetApp {
                         }
                     });
                 });
+
+            // Save current edit if user clicked away (use the PREVIOUS editing cell)
+            if save_current_edit {
+                if let Some((edit_row, edit_col)) = previous_editing_cell {
+                    if let Some(row_data) = self.data.get_mut(edit_row) {
+                        if let Some(edit_cell) = row_data.get_mut(edit_col) {
+                            *edit_cell = self.edit_buffer.clone();
+                        }
+                    }
+                }
+            }
 
             // Update selection based on drag AFTER table render
             if let Some(end_cell) = drag_end_cell {
@@ -925,5 +971,6 @@ impl eframe::App for SpreadsheetApp {
                 }
             }
         });
+        }
     }
 }

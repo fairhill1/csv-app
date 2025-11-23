@@ -10,3 +10,4 @@ egui_extras = "0.33"
 csv = "1.4"
 rfd = "0.15"
 arboard = "3.6"
+image = { version = "0.25", default-features = false, features = ["png"] }

@@ -19,10 +19,29 @@ enum PendingAction {
     Exit,
 }
 
+fn load_icon() -> Option<egui::IconData> {
+    let icon_bytes = include_bytes!("../logo-nobg.png");
+    let image = image::load_from_memory(icon_bytes).ok()?;
+    let rgba = image.to_rgba8();
+    let (width, height) = rgba.dimensions();
+
+    Some(egui::IconData {
+        rgba: rgba.into_raw(),
+        width: width as u32,
+        height: height as u32,
+    })
+}
+
 fn main() -> eframe::Result<()> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1200.0, 800.0]);
+
+    if let Some(icon) = load_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 800.0]),
+        viewport,
         ..Default::default()
     };
 
@@ -460,7 +479,10 @@ impl eframe::App for SpreadsheetApp {
 
         // Apply theme
         if self.dark_mode {
-            ctx.set_visuals(egui::Visuals::dark());
+            let mut visuals = egui::Visuals::dark();
+            // Make text whiter for better contrast
+            visuals.override_text_color = Some(egui::Color32::from_rgb(240, 240, 240));
+            ctx.set_visuals(visuals);
         } else {
             ctx.set_visuals(egui::Visuals::light());
         }

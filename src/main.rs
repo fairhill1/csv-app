@@ -37,6 +37,7 @@ struct SpreadsheetApp {
     clipboard: arboard::Clipboard,
     undo_stack: Vec<Vec<Vec<String>>>,
     redo_stack: Vec<Vec<Vec<String>>>,
+    show_new_file_confirm: bool,
 }
 
 impl Default for SpreadsheetApp {
@@ -53,6 +54,7 @@ impl Default for SpreadsheetApp {
             clipboard: arboard::Clipboard::new().unwrap(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            show_new_file_confirm: false,
         }
     }
 }
@@ -530,6 +532,11 @@ impl eframe::App for SpreadsheetApp {
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
+                    if ui.button("New").clicked() {
+                        self.show_new_file_confirm = true;
+                        ui.close();
+                    }
+
                     if ui.button("Open CSV").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("CSV", &["csv"])
@@ -562,15 +569,29 @@ impl eframe::App for SpreadsheetApp {
                         }
                         ui.close();
                     }
-
-                    if ui.button("New").clicked() {
-                        self.data = vec![vec![String::new(); 10]; 20];
-                        self.file_path = None;
-                        ui.close();
-                    }
                 });
 
                 ui.menu_button("Edit", |ui| {
+                    if ui.button("Cut").clicked() {
+                        self.cut_selection();
+                        ui.close();
+                    }
+
+                    if ui.button("Copy").clicked() {
+                        self.copy_selection();
+                        ui.close();
+                    }
+
+                    if ui.button("Paste").clicked() {
+                        if let Ok(text) = self.clipboard.get_text() {
+                            self.save_undo_state();
+                            self.paste_text(&text);
+                        }
+                        ui.close();
+                    }
+
+                    ui.separator();
+
                     if ui.button("Add Row").clicked() {
                         self.add_row();
                         ui.close();
@@ -583,6 +604,30 @@ impl eframe::App for SpreadsheetApp {
                 });
             });
         });
+
+        // Show confirmation dialog for new file
+        if self.show_new_file_confirm {
+            egui::Window::new("Confirm New File")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("Are you sure you want to create a new file?");
+                    ui.label("All unsaved changes will be lost.");
+                    ui.add_space(10.0);
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Yes, create new file").clicked() {
+                            self.data = vec![vec![String::new(); 10]; 20];
+                            self.file_path = None;
+                            self.show_new_file_confirm = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.show_new_file_confirm = false;
+                        }
+                    });
+                });
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let num_rows = self.data.len();
@@ -767,9 +812,10 @@ impl eframe::App for SpreadsheetApp {
                                                 );
                                             }
 
-                                            // Draw the text
+                                            // Draw the text with clipping to prevent overflow
+                                            let text_rect = rect.shrink2(egui::vec2(4.0, 0.0));
                                             let text_pos = rect.left_center() + egui::vec2(4.0, 0.0);
-                                            ui.painter().text(
+                                            ui.painter().with_clip_rect(text_rect).text(
                                                 text_pos,
                                                 egui::Align2::LEFT_CENTER,
                                                 &*cell_val,

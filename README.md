@@ -16,15 +16,47 @@ A lightweight spreadsheet application built with Rust, egui, and CSV support.
 
 ## Building
 
+### Native Desktop App
+
 ```bash
 cargo build --release
 ```
 
+### WASM Web App
+
+```bash
+./build-wasm.sh
+```
+
+This will:
+1. Install required tools (trunk, wasm-bindgen-cli) if needed
+2. Add the wasm32 target
+3. Build the WASM binary
+4. Generate JavaScript bindings
+5. Output everything to the `dist/` directory
+
+To serve the WASM app locally:
+```bash
+python3 -m http.server 8080 --directory dist
+```
+Then open http://localhost:8080 in your browser.
+
 ## Running
+
+### Native Desktop App
 
 ```bash
 cargo run --release
 ```
+
+### WASM Web App
+
+See the WASM build instructions above.
+
+**Note**: In the WASM version:
+- File operations use browser downloads/uploads instead of native file dialogs
+- Use Cmd+Shift+S or "Save As..." to download the CSV file
+- File open dialogs are currently disabled (drag-and-drop support coming soon)
 
 ## Usage
 

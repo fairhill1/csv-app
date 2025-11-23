@@ -2,6 +2,63 @@ use eframe::egui;
 use egui_extras::{TableBuilder, Column};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+// Structure to hold data loaded asynchronously (WASM)
+#[cfg(target_arch = "wasm32")]
+#[derive(Default, Clone)]
+struct AsyncFileResult {
+    data: Option<Vec<u8>>,
+    filename: Option<String>,
+}
+
+// Platform-specific clipboard implementation
+#[cfg(not(target_arch = "wasm32"))]
+struct ClipboardContext {
+    clipboard: arboard::Clipboard,
+}
+
+#[cfg(target_arch = "wasm32")]
+struct ClipboardContext {}
+
+impl ClipboardContext {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn new() -> Option<Self> {
+        arboard::Clipboard::new().ok().map(|clipboard| Self { clipboard })
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn new() -> Option<Self> {
+        Some(Self {})
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn set_text(&mut self, text: String) -> Result<(), Box<dyn std::error::Error>> {
+        self.clipboard.set_text(text)?;
+        Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn set_text(&mut self, text: String) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(window) = web_sys::window() {
+            let navigator = window.navigator();
+            let clipboard = navigator.clipboard();
+            let _ = clipboard.write_text(&text);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn get_text(&mut self) -> Result<String, Box<dyn std::error::Error>> {
+        Ok(self.clipboard.get_text()?)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn get_text(&mut self) -> Result<String, Box<dyn std::error::Error>> {
+        // In WASM, we'll rely on egui's paste events instead
+        Err("Use egui paste events in WASM".into())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 enum Selection {
@@ -19,6 +76,7 @@ enum PendingAction {
     Exit,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn load_icon() -> Option<egui::IconData> {
     let icon_bytes = include_bytes!("../logo-nobg.png");
     let image = image::load_from_memory(icon_bytes).ok()?;
@@ -32,6 +90,8 @@ fn load_icon() -> Option<egui::IconData> {
     })
 }
 
+// Native entry point
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1200.0, 800.0]);
@@ -52,6 +112,57 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+// WASM entry point
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    use wasm_bindgen::JsCast;
+
+    // Redirect tracing to console.log and friends:
+    eframe::WebLogger::init(log::LevelFilter::Debug).ok();
+
+    let web_options = eframe::WebOptions::default();
+
+    wasm_bindgen_futures::spawn_local(async {
+        // Get the canvas element
+        let document = web_sys::window()
+            .expect("No window")
+            .document()
+            .expect("No document");
+
+        let canvas = document
+            .get_element_by_id("the_canvas_id")
+            .expect("Canvas not found")
+            .dyn_into::<web_sys::HtmlCanvasElement>()
+            .expect("Element is not a canvas");
+
+        let start_result = eframe::WebRunner::new()
+            .start(
+                canvas,
+                web_options,
+                Box::new(|_cc| Ok(Box::new(SpreadsheetApp::default()))),
+            )
+            .await;
+
+        // Remove the loading text and spinner:
+        let loading_text = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.get_element_by_id("loading_text"));
+        if let Some(loading_text) = loading_text {
+            match start_result {
+                Ok(_) => {
+                    loading_text.remove();
+                }
+                Err(e) => {
+                    loading_text.set_inner_html(
+                        "<p> The app has crashed. See the developer console for details. </p>",
+                    );
+                    panic!("Failed to start eframe: {e:?}");
+                }
+            }
+        }
+    });
+}
+
 struct SpreadsheetApp {
     data: Vec<Vec<String>>,
     file_path: Option<PathBuf>,
@@ -61,7 +172,7 @@ struct SpreadsheetApp {
     default_column_width: f32,
     selection: Selection,
     drag_start: Option<(usize, usize)>,
-    clipboard: arboard::Clipboard,
+    clipboard: ClipboardContext,
     undo_stack: Vec<Vec<Vec<String>>>,
     redo_stack: Vec<Vec<Vec<String>>>,
     pending_action: PendingAction,
@@ -69,6 +180,8 @@ struct SpreadsheetApp {
     allowed_to_close: bool,
     table_id_salt: u64, // Change this to reset table state
     dark_mode: bool,
+    #[cfg(target_arch = "wasm32")]
+    async_file_loading: Arc<Mutex<AsyncFileResult>>,
 }
 
 impl Default for SpreadsheetApp {
@@ -82,7 +195,7 @@ impl Default for SpreadsheetApp {
             default_column_width: 120.0,
             selection: Selection::None,
             drag_start: None,
-            clipboard: arboard::Clipboard::new().unwrap(),
+            clipboard: ClipboardContext::new().unwrap(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             pending_action: PendingAction::None,
@@ -90,6 +203,8 @@ impl Default for SpreadsheetApp {
             allowed_to_close: false,
             table_id_salt: 0,
             dark_mode: true, // Default to dark mode
+            #[cfg(target_arch = "wasm32")]
+            async_file_loading: Arc::new(Mutex::new(AsyncFileResult::default())),
         }
     }
 }
@@ -156,46 +271,101 @@ impl SpreadsheetApp {
         }
     }
 
+    #[allow(dead_code)]
     fn load_csv(&mut self, path: PathBuf) {
-        match csv::Reader::from_path(&path) {
-            Ok(mut reader) => {
-                let mut data = Vec::new();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            match csv::Reader::from_path(&path) {
+                Ok(mut reader) => {
+                    let mut data = Vec::new();
 
-                // Add headers as first row
-                if let Ok(headers) = reader.headers() {
-                    let header_row: Vec<String> = headers.iter().map(|s| s.to_string()).collect();
-                    data.push(header_row);
-                }
-
-                // Add data rows
-                for result in reader.records() {
-                    if let Ok(record) = result {
-                        let row: Vec<String> = record.iter().map(|s| s.to_string()).collect();
-                        data.push(row);
+                    // Add headers as first row
+                    if let Ok(headers) = reader.headers() {
+                        let header_row: Vec<String> = headers.iter().map(|s| s.to_string()).collect();
+                        data.push(header_row);
                     }
-                }
 
-                self.data = data;
-                // Normalize immediately to ensure rectangular structure
-                self.normalize_data();
-                self.file_path = Some(path);
-                self.has_unsaved_changes = false;
+                    // Add data rows
+                    for result in reader.records() {
+                        if let Ok(record) = result {
+                            let row: Vec<String> = record.iter().map(|s| s.to_string()).collect();
+                            data.push(row);
+                        }
+                    }
+
+                    self.data = data;
+                    // Normalize immediately to ensure rectangular structure
+                    self.normalize_data();
+                    self.file_path = Some(path);
+                    self.has_unsaved_changes = false;
+                }
+                Err(e) => {
+                    eprintln!("Error loading CSV: {}", e);
+                }
             }
-            Err(e) => {
-                eprintln!("Error loading CSV: {}", e);
-            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Store path for display purposes
+            self.file_path = Some(path);
         }
     }
 
+    #[allow(dead_code)]
+    fn load_csv_from_bytes(&mut self, bytes: &[u8], filename: String) {
+        let mut reader = csv::Reader::from_reader(bytes);
+        let mut data = Vec::new();
+
+        // Add headers as first row
+        if let Ok(headers) = reader.headers() {
+            let header_row: Vec<String> = headers.iter().map(|s| s.to_string()).collect();
+            data.push(header_row);
+        }
+
+        // Add data rows
+        for result in reader.records() {
+            if let Ok(record) = result {
+                let row: Vec<String> = record.iter().map(|s| s.to_string()).collect();
+                data.push(row);
+            }
+        }
+
+        self.data = data;
+        // Normalize immediately to ensure rectangular structure
+        self.normalize_data();
+        self.file_path = Some(PathBuf::from(filename));
+        self.has_unsaved_changes = false;
+    }
+
     fn save_csv(&self, path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-        let mut writer = csv::Writer::from_path(path)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut writer = csv::Writer::from_path(path)?;
+
+            for row in &self.data {
+                writer.write_record(row)?;
+            }
+
+            writer.flush()?;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            // WASM save will be handled via download
+            let _ = path; // Suppress unused warning
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn save_csv_to_bytes(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut writer = csv::Writer::from_writer(Vec::new());
 
         for row in &self.data {
             writer.write_record(row)?;
         }
 
         writer.flush()?;
-        Ok(())
+        Ok(writer.into_inner()?)
     }
 
     fn add_row(&mut self) {
@@ -442,10 +612,97 @@ impl SpreadsheetApp {
             }
         }
     }
+
+    #[cfg(target_arch = "wasm32")]
+    fn download_file(&self, data: &[u8], filename: &str) {
+        use wasm_bindgen::JsCast;
+
+        if let Some(window) = web_sys::window() {
+            if let Some(document) = window.document() {
+                // Create a blob from the data
+                let array = js_sys::Uint8Array::new_with_length(data.len() as u32);
+                array.copy_from(data);
+                let blob_parts = js_sys::Array::new();
+                blob_parts.push(&array);
+
+                if let Ok(blob) = web_sys::Blob::new_with_u8_array_sequence(&blob_parts) {
+                    if let Ok(url) = web_sys::Url::create_object_url_with_blob(&blob) {
+                        // Create download link
+                        if let Ok(element) = document.create_element("a") {
+                            if let Ok(anchor) = element.dyn_into::<web_sys::HtmlAnchorElement>() {
+                                anchor.set_href(&url);
+                                anchor.set_download(filename);
+                                anchor.click();
+                                let _ = web_sys::Url::revoke_object_url(&url);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn trigger_open_file(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("CSV", &["csv"])
+                .pick_file()
+            {
+                self.load_csv(path);
+            }
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let result_clone = self.async_file_loading.clone();
+
+            // Spawn a future to handle the file picker
+            wasm_bindgen_futures::spawn_local(async move {
+                // rfd::AsyncFileDialog works perfectly in WASM
+                let file = rfd::AsyncFileDialog::new()
+                    .add_filter("CSV", &["csv"])
+                    .pick_file()
+                    .await;
+
+                if let Some(file_handle) = file {
+                    let name = file_handle.file_name();
+                    let bytes = file_handle.read().await; // Reads into Vec<u8>
+
+                    // Lock the mutex and store the data
+                    if let Ok(mut guard) = result_clone.lock() {
+                        guard.data = Some(bytes);
+                        guard.filename = Some(name);
+                    }
+                }
+            });
+        }
+    }
 }
 
 impl eframe::App for SpreadsheetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Poll for loaded files (WASM)
+        #[cfg(target_arch = "wasm32")]
+        {
+            let mut loaded_data = None;
+
+            // Minimal lock scope
+            if let Ok(mut guard) = self.async_file_loading.lock() {
+                if guard.data.is_some() {
+                    // Move data out of the mutex
+                    loaded_data = Some((
+                        guard.data.take().unwrap(),
+                        guard.filename.take().unwrap(),
+                    ));
+                }
+            }
+
+            if let Some((bytes, filename)) = loaded_data {
+                self.load_csv_from_bytes(&bytes, filename);
+            }
+        }
+
         // Intercept window close button (X)
         if ctx.input(|i| i.viewport().close_requested()) {
             if self.allowed_to_close {
@@ -507,25 +764,43 @@ impl eframe::App for SpreadsheetApp {
                 if self.has_unsaved_changes {
                     self.pending_action = PendingAction::OpenFile;
                 } else {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("CSV", &["csv"])
-                        .pick_file()
+                    #[cfg(not(target_arch = "wasm32"))]
                     {
-                        self.load_csv(path);
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("CSV", &["csv"])
+                            .pick_file()
+                        {
+                            self.load_csv(path);
+                        }
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        self.trigger_open_file();
                     }
                 }
             }
 
             // Cmd+Shift+S - Save As
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT), egui::Key::S)) {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("CSV", &["csv"])
-                    .save_file()
+                #[cfg(not(target_arch = "wasm32"))]
                 {
-                    if let Err(e) = self.save_csv(&path) {
-                        eprintln!("Error saving CSV: {}", e);
-                    } else {
-                        self.file_path = Some(path);
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("CSV", &["csv"])
+                        .save_file()
+                    {
+                        if let Err(e) = self.save_csv(&path) {
+                            eprintln!("Error saving CSV: {}", e);
+                        } else {
+                            self.file_path = Some(path);
+                            self.has_unsaved_changes = false;
+                        }
+                    }
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    // WASM: Trigger download
+                    if let Ok(bytes) = self.save_csv_to_bytes() {
+                        self.download_file(&bytes, "spreadsheet.csv");
                         self.has_unsaved_changes = false;
                     }
                 }
@@ -686,11 +961,18 @@ impl eframe::App for SpreadsheetApp {
                             self.pending_action = PendingAction::OpenFile;
                         } else {
                             // No unsaved changes, open file directly
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("CSV", &["csv"])
-                                .pick_file()
+                            #[cfg(not(target_arch = "wasm32"))]
                             {
-                                self.load_csv(path);
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("CSV", &["csv"])
+                                    .pick_file()
+                                {
+                                    self.load_csv(path);
+                                }
+                            }
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                self.trigger_open_file();
                             }
                         }
                         ui.close();
@@ -708,14 +990,24 @@ impl eframe::App for SpreadsheetApp {
                     }
 
                     if ui.button("Save As...").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("CSV", &["csv"])
-                            .save_file()
+                        #[cfg(not(target_arch = "wasm32"))]
                         {
-                            if let Err(e) = self.save_csv(&path) {
-                                eprintln!("Error saving CSV: {}", e);
-                            } else {
-                                self.file_path = Some(path);
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("CSV", &["csv"])
+                                .save_file()
+                            {
+                                if let Err(e) = self.save_csv(&path) {
+                                    eprintln!("Error saving CSV: {}", e);
+                                } else {
+                                    self.file_path = Some(path);
+                                    self.has_unsaved_changes = false;
+                                }
+                            }
+                        }
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            if let Ok(bytes) = self.save_csv_to_bytes() {
+                                self.download_file(&bytes, "spreadsheet.csv");
                                 self.has_unsaved_changes = false;
                             }
                         }
@@ -1202,11 +1494,18 @@ impl eframe::App for SpreadsheetApp {
                                     self.pending_action = PendingAction::None;
                                 }
                                 PendingAction::OpenFile => {
-                                    if let Some(path) = rfd::FileDialog::new()
-                                        .add_filter("CSV", &["csv"])
-                                        .pick_file()
+                                    #[cfg(not(target_arch = "wasm32"))]
                                     {
-                                        self.load_csv(path);
+                                        if let Some(path) = rfd::FileDialog::new()
+                                            .add_filter("CSV", &["csv"])
+                                            .pick_file()
+                                        {
+                                            self.load_csv(path);
+                                        }
+                                    }
+                                    #[cfg(target_arch = "wasm32")]
+                                    {
+                                        self.trigger_open_file();
                                     }
                                     self.pending_action = PendingAction::None;
                                 }

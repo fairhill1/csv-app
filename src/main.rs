@@ -47,6 +47,7 @@ struct SpreadsheetApp {
     redo_stack: Vec<Vec<Vec<String>>>,
     pending_action: PendingAction,
     has_unsaved_changes: bool,
+    allowed_to_close: bool,
     table_id_salt: u64, // Change this to reset table state
     dark_mode: bool,
 }
@@ -67,6 +68,7 @@ impl Default for SpreadsheetApp {
             redo_stack: Vec::new(),
             pending_action: PendingAction::None,
             has_unsaved_changes: false,
+            allowed_to_close: false,
             table_id_salt: 0,
             dark_mode: true, // Default to dark mode
         }
@@ -425,14 +427,16 @@ impl SpreadsheetApp {
 
 impl eframe::App for SpreadsheetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Intercept close requests to show confirmation modal
+        // Intercept window close button (X)
         if ctx.input(|i| i.viewport().close_requested()) {
-            if self.has_unsaved_changes && self.pending_action != PendingAction::Exit {
+            if self.allowed_to_close {
+                // User confirmed exit - allow window to close
+            } else if self.has_unsaved_changes {
                 // Prevent close and show confirmation modal
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.pending_action = PendingAction::Exit;
             }
-            // If no unsaved changes or user confirmed, allow the window to close
+            // If no unsaved changes, allow window to close
         }
 
         // Update window title to show filename and unsaved changes indicator
@@ -463,6 +467,58 @@ impl eframe::App for SpreadsheetApp {
 
         // Handle keyboard input - check shortcuts early before any UI
         let not_editing = self.editing_cell.is_none();
+
+        // File operation shortcuts (Cmd/Ctrl + S/N/O/Shift+S)
+        if not_editing {
+            // Cmd+N - New File
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::N)) {
+                if self.has_unsaved_changes {
+                    self.pending_action = PendingAction::NewFile;
+                } else {
+                    self.data = vec![vec![String::new(); 10]; 20];
+                    self.file_path = None;
+                }
+            }
+
+            // Cmd+O - Open File
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {
+                if self.has_unsaved_changes {
+                    self.pending_action = PendingAction::OpenFile;
+                } else {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("CSV", &["csv"])
+                        .pick_file()
+                    {
+                        self.load_csv(path);
+                    }
+                }
+            }
+
+            // Cmd+Shift+S - Save As
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT), egui::Key::S)) {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("CSV", &["csv"])
+                    .save_file()
+                {
+                    if let Err(e) = self.save_csv(&path) {
+                        eprintln!("Error saving CSV: {}", e);
+                    } else {
+                        self.file_path = Some(path);
+                        self.has_unsaved_changes = false;
+                    }
+                }
+            }
+            // Cmd+S - Save (must come after Cmd+Shift+S check)
+            else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
+                if let Some(ref path) = self.file_path {
+                    if let Err(e) = self.save_csv(path) {
+                        eprintln!("Error saving CSV: {}", e);
+                    } else {
+                        self.has_unsaved_changes = false;
+                    }
+                }
+            }
+        }
 
         // Handle high-level copy/paste/cut events from OS
         let mut do_copy = false;
@@ -960,6 +1016,11 @@ impl eframe::App for SpreadsheetApp {
                                                 }
                                             }
 
+                                            // Clear drag state when opening context menu (right-click)
+                                            if response.secondary_clicked() {
+                                                self.drag_start = None;
+                                            }
+
                                             response.context_menu(|ui| {
                                                 if ui.button("Cut").clicked() {
                                                     self.cut_selection();
@@ -1130,8 +1191,8 @@ impl eframe::App for SpreadsheetApp {
                                     self.pending_action = PendingAction::None;
                                 }
                                 PendingAction::Exit => {
-                                    // Clear unsaved flag so the next close attempt succeeds
-                                    self.has_unsaved_changes = false;
+                                    // Set allowed_to_close so the next close attempt succeeds
+                                    self.allowed_to_close = true;
                                     self.pending_action = PendingAction::None;
                                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                                 }
@@ -1140,6 +1201,7 @@ impl eframe::App for SpreadsheetApp {
                         }
                         if ui.button("Cancel").clicked() {
                             self.pending_action = PendingAction::None;
+                            self.allowed_to_close = false;
                         }
                     });
                 });

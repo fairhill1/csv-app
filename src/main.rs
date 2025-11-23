@@ -644,6 +644,9 @@ impl eframe::App for SpreadsheetApp {
                 egui::ScrollArea::both()
                     .auto_shrink([false; 2])
                     .show(ui, |ui| {
+                        // Remove spacing between cells to create continuous grid
+                        ui.style_mut().spacing.item_spacing = egui::vec2(0.0, 0.0);
+
                         // Track if we should save current edit when clicking away
                         let mut save_current_edit = false;
                         let previous_editing_cell = self.editing_cell; // Capture BEFORE we change it
@@ -663,6 +666,7 @@ impl eframe::App for SpreadsheetApp {
                 .striped(true)
                 .resizable(true)
                 .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .vscroll(false) // Disable internal scroll since we have outer ScrollArea
                 .column(Column::initial(50.0).at_least(30.0)); // Row index column
 
             // Add data columns with custom widths
@@ -796,37 +800,63 @@ impl eframe::App for SpreadsheetApp {
                                         return; // Skip if column doesn't exist yet
                                     }
                                     let cell_val = &mut row_data[col_idx];
-                                        if is_editing {
-                                            let text_edit = egui::TextEdit::singleline(&mut self.edit_buffer)
-                                                .frame(true);
+                                        // Create an interactive area that fills the cell
+                                        let (rect, response) = ui.allocate_exact_size(
+                                            ui.available_size(),
+                                            egui::Sense::click_and_drag()
+                                        );
 
-                                            let response = ui.add(text_edit);
+                                        // Draw cell background
+                                        let bg_color = if is_selected {
+                                            egui::Color32::from_rgb(180, 210, 240)
+                                        } else {
+                                            egui::Color32::TRANSPARENT
+                                        };
+
+                                        if bg_color != egui::Color32::TRANSPARENT {
+                                            ui.painter().rect_filled(rect, 0.0, bg_color);
+                                        }
+
+                                        // Draw cell border (blue if editing, normal grid color otherwise)
+                                        let border_color = if is_editing {
+                                            egui::Color32::from_rgb(66, 133, 244) // Blue border when editing
+                                        } else {
+                                            ui.visuals().widgets.noninteractive.bg_stroke.color
+                                        };
+
+                                        let border_width = if is_editing { 2.0 } else { 0.5 };
+
+                                        ui.painter().rect_stroke(
+                                            rect,
+                                            0.0,
+                                            egui::Stroke::new(border_width, border_color),
+                                            egui::epaint::StrokeKind::Inside
+                                        );
+
+                                        if is_editing {
+                                            // Show text edit without frame, just cursor
+                                            let edit_rect = rect.shrink2(egui::vec2(4.0, 2.0));
+                                            let mut child_ui = ui.new_child(
+                                                egui::UiBuilder::new()
+                                                    .max_rect(edit_rect)
+                                                    .layout(egui::Layout::left_to_right(egui::Align::Center))
+                                            );
+
+                                            let text_edit = egui::TextEdit::singleline(&mut self.edit_buffer)
+                                                .frame(false);
+
+                                            let edit_response = child_ui.add(text_edit);
 
                                             // Check if Enter was pressed to move down
                                             let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
 
-                                            if response.lost_focus() || enter_pressed {
+                                            if edit_response.lost_focus() || enter_pressed {
                                                 *cell_val = self.edit_buffer.clone();
                                                 self.editing_cell = None;
                                             }
 
-                                            response.request_focus();
+                                            edit_response.request_focus();
                                         } else {
-                                            // Create an interactive area that fills the cell
-                                            let (rect, response) = ui.allocate_exact_size(
-                                                ui.available_size(),
-                                                egui::Sense::click_and_drag()
-                                            );
-
-                                            // Draw selection background
-                                            if is_selected {
-                                                ui.painter().rect_filled(
-                                                    rect,
-                                                    0.0,
-                                                    egui::Color32::from_rgb(180, 210, 240)
-                                                );
-                                            }
-
                                             // Draw the text with clipping to prevent overflow
                                             let text_rect = rect.shrink2(egui::vec2(4.0, 0.0));
                                             let text_pos = rect.left_center() + egui::vec2(4.0, 0.0);

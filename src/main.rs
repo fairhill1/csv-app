@@ -223,7 +223,7 @@ impl Default for SpreadsheetApp {
             current_search_result: 0,
             sorted_column: None,
             sort_ascending: true,
-            freeze_top_row: true, // Default to frozen, common for CSVs
+            freeze_top_row: false,
             #[cfg(target_arch = "wasm32")]
             async_file_loading: Arc::new(Mutex::new(AsyncFileResult::default())),
         }

@@ -183,6 +183,16 @@ struct SpreadsheetApp {
     allowed_to_close: bool,
     table_id_salt: u64, // Change this to reset table state
     dark_mode: bool,
+    // Search functionality
+    search_window_open: bool,
+    search_query: String,
+    search_case_sensitive: bool,
+    search_results: Vec<(usize, usize)>,
+    current_search_result: usize,
+    // Sort tracking
+    sorted_column: Option<usize>,
+    sort_ascending: bool,
+    freeze_top_row: bool,
     #[cfg(target_arch = "wasm32")]
     async_file_loading: Arc<Mutex<AsyncFileResult>>,
 }
@@ -206,6 +216,14 @@ impl Default for SpreadsheetApp {
             allowed_to_close: false,
             table_id_salt: 0,
             dark_mode: true, // Default to dark mode
+            search_window_open: false,
+            search_query: String::new(),
+            search_case_sensitive: false,
+            search_results: Vec::new(),
+            current_search_result: 0,
+            sorted_column: None,
+            sort_ascending: true,
+            freeze_top_row: true, // Default to frozen, common for CSVs
             #[cfg(target_arch = "wasm32")]
             async_file_loading: Arc::new(Mutex::new(AsyncFileResult::default())),
         }
@@ -491,6 +509,8 @@ impl SpreadsheetApp {
             self.redo_stack.push(self.data.clone());
             self.data = prev_state;
             self.has_unsaved_changes = true;
+            // Clear sort indicator since data state changed
+            self.sorted_column = None;
         }
     }
 
@@ -499,6 +519,8 @@ impl SpreadsheetApp {
             self.undo_stack.push(self.data.clone());
             self.data = next_state;
             self.has_unsaved_changes = true;
+            // Clear sort indicator since data state changed
+            self.sorted_column = None;
         }
     }
 
@@ -614,6 +636,122 @@ impl SpreadsheetApp {
                 self.editing_cell = None;
             }
         }
+    }
+
+    fn perform_search(&mut self) {
+        self.search_results.clear();
+        self.current_search_result = 0;
+
+        if self.search_query.is_empty() {
+            return;
+        }
+
+        let query = if self.search_case_sensitive {
+            self.search_query.clone()
+        } else {
+            self.search_query.to_lowercase()
+        };
+
+        for (row_idx, row) in self.data.iter().enumerate() {
+            for (col_idx, cell) in row.iter().enumerate() {
+                let cell_text = if self.search_case_sensitive {
+                    cell.clone()
+                } else {
+                    cell.to_lowercase()
+                };
+
+                if cell_text.contains(&query) {
+                    self.search_results.push((row_idx, col_idx));
+                }
+            }
+        }
+    }
+
+    fn go_to_next_search_result(&mut self) {
+        if !self.search_results.is_empty() {
+            self.current_search_result = (self.current_search_result + 1) % self.search_results.len();
+            let (row, col) = self.search_results[self.current_search_result];
+            self.selection = Selection::CellRange {
+                start: (row, col),
+                end: (row, col),
+            };
+            self.editing_cell = None;
+        }
+    }
+
+    fn go_to_prev_search_result(&mut self) {
+        if !self.search_results.is_empty() {
+            if self.current_search_result == 0 {
+                self.current_search_result = self.search_results.len() - 1;
+            } else {
+                self.current_search_result -= 1;
+            }
+            let (row, col) = self.search_results[self.current_search_result];
+            self.selection = Selection::CellRange {
+                start: (row, col),
+                end: (row, col),
+            };
+            self.editing_cell = None;
+        }
+    }
+
+    fn sort_by_column(&mut self, col_idx: usize, ascending: bool) {
+        if self.data.is_empty() {
+            return;
+        }
+
+        self.save_undo_state();
+
+        if self.freeze_top_row && self.data.len() > 1 {
+            // Sort only data rows (skip first row which is the header)
+            let mut header = self.data[0].clone();
+            let mut data_rows: Vec<Vec<String>> = self.data[1..].to_vec();
+
+            data_rows.sort_by(|a, b| {
+                let a_val = a.get(col_idx).map(|s| s.as_str()).unwrap_or("");
+                let b_val = b.get(col_idx).map(|s| s.as_str()).unwrap_or("");
+
+                // Try to parse as numbers first
+                let cmp = match (a_val.parse::<f64>(), b_val.parse::<f64>()) {
+                    (Ok(a_num), Ok(b_num)) => a_num.partial_cmp(&b_num).unwrap_or(std::cmp::Ordering::Equal),
+                    _ => a_val.cmp(b_val),
+                };
+
+                if ascending {
+                    cmp
+                } else {
+                    cmp.reverse()
+                }
+            });
+
+            // Reconstruct with header at top
+            self.data.clear();
+            self.data.push(header);
+            self.data.extend(data_rows);
+        } else {
+            // Sort all data (no frozen row)
+            self.data.sort_by(|a, b| {
+                let a_val = a.get(col_idx).map(|s| s.as_str()).unwrap_or("");
+                let b_val = b.get(col_idx).map(|s| s.as_str()).unwrap_or("");
+
+                // Try to parse as numbers first
+                let cmp = match (a_val.parse::<f64>(), b_val.parse::<f64>()) {
+                    (Ok(a_num), Ok(b_num)) => a_num.partial_cmp(&b_num).unwrap_or(std::cmp::Ordering::Equal),
+                    _ => a_val.cmp(b_val),
+                };
+
+                if ascending {
+                    cmp
+                } else {
+                    cmp.reverse()
+                }
+            });
+        }
+
+        // Track which column is sorted
+        self.sorted_column = Some(col_idx);
+        self.sort_ascending = ascending;
+        self.has_unsaved_changes = true;
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -895,8 +1033,11 @@ impl eframe::App for SpreadsheetApp {
         }
 
         // Handle other keyboard shortcuts
-        if not_editing && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::A)) {
+        if not_editing && !self.search_window_open && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::A)) {
             self.select_all();
+        }
+        if not_editing && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+            self.search_window_open = true;
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Y)) {
             self.redo();
@@ -948,8 +1089,8 @@ impl eframe::App for SpreadsheetApp {
                 }
             }
 
-            // Start editing on text input when single cell is selected
-            if self.editing_cell.is_none() {
+            // Start editing on text input when single cell is selected (but not when search window is open)
+            if self.editing_cell.is_none() && !self.search_window_open {
                 if let Selection::CellRange { start, end } = &self.selection {
                     if start == end {
                         // Single cell selected, check for text input
@@ -1081,6 +1222,12 @@ impl eframe::App for SpreadsheetApp {
                 });
 
                 ui.menu_button("View", |ui| {
+                    if ui.checkbox(&mut self.freeze_top_row, "Freeze Top Row").clicked() {
+                        ui.close();
+                    }
+
+                    ui.separator();
+
                     if ui.button("Reset Column Widths").clicked() {
                         self.column_widths.clear();
                         self.table_id_salt += 1; // Change table ID to reset egui's internal state
@@ -1162,11 +1309,16 @@ impl eframe::App for SpreadsheetApp {
                                 ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(100, 150, 200));
                             }
 
-                            // Draw column letter
+                            // Draw column letter with sort indicator
+                            let mut col_text = Self::col_index_to_letter(col_idx);
+                            if self.sorted_column == Some(col_idx) {
+                                col_text.push(' ');
+                                col_text.push(if self.sort_ascending { '^' } else { 'v' });
+                            }
                             ui.painter().text(
                                 rect.center(),
                                 egui::Align2::CENTER_CENTER,
-                                Self::col_index_to_letter(col_idx),
+                                col_text,
                                 egui::FontId::default(),
                                 ui.visuals().text_color()
                             );
@@ -1177,6 +1329,15 @@ impl eframe::App for SpreadsheetApp {
                             }
 
                             response.context_menu(|ui| {
+                                if ui.button("Sort Ascending").clicked() {
+                                    self.sort_by_column(col_idx, true);
+                                    ui.close();
+                                }
+                                if ui.button("Sort Descending").clicked() {
+                                    self.sort_by_column(col_idx, false);
+                                    ui.close();
+                                }
+                                ui.separator();
                                 if ui.button("Insert Column Left").clicked() {
                                     insert_col_at = Some(col_idx);
                                     ui.close();
@@ -1262,6 +1423,11 @@ impl eframe::App for SpreadsheetApp {
                                     Selection::Row(r) => row_idx == *r,
                                 };
 
+                                // Check if cell is in search results
+                                let is_search_match = self.search_results.contains(&(row_idx, col_idx));
+                                let is_current_search_result = !self.search_results.is_empty()
+                                    && self.search_results.get(self.current_search_result) == Some(&(row_idx, col_idx));
+
                                 if let Some(row_data) = self.data.get_mut(row_idx) {
                                     if col_idx >= row_data.len() {
                                         return; // Skip if column doesn't exist yet
@@ -1273,9 +1439,35 @@ impl eframe::App for SpreadsheetApp {
                                             egui::Sense::click_and_drag()
                                         );
 
-                                        // Draw cell background
-                                        let bg_color = if is_selected {
-                                            egui::Color32::from_rgb(180, 210, 240)
+                                        // Check if this is the frozen header row
+                                        let is_frozen_header = self.freeze_top_row && row_idx == 0;
+
+                                        // Draw cell background with priority: frozen header > current search result > search match > selected > normal
+                                        // Use different colors for dark vs light mode
+                                        let bg_color = if is_frozen_header {
+                                            if self.dark_mode {
+                                                egui::Color32::from_rgb(50, 50, 60) // Slightly lighter than background for dark mode
+                                            } else {
+                                                egui::Color32::from_rgb(230, 230, 240) // Slightly darker than background for light mode
+                                            }
+                                        } else if is_current_search_result {
+                                            if self.dark_mode {
+                                                egui::Color32::from_rgb(180, 100, 0) // Dark orange for dark mode
+                                            } else {
+                                                egui::Color32::from_rgb(255, 200, 100) // Light orange for light mode
+                                            }
+                                        } else if is_search_match {
+                                            if self.dark_mode {
+                                                egui::Color32::from_rgb(120, 100, 0) // Dark gold for dark mode
+                                            } else {
+                                                egui::Color32::from_rgb(255, 255, 150) // Light yellow for light mode
+                                            }
+                                        } else if is_selected {
+                                            if self.dark_mode {
+                                                egui::Color32::from_rgb(60, 90, 120) // Dark blue for dark mode
+                                            } else {
+                                                egui::Color32::from_rgb(180, 210, 240) // Light blue for light mode
+                                            }
                                         } else {
                                             egui::Color32::TRANSPARENT
                                         };
@@ -1328,11 +1520,19 @@ impl eframe::App for SpreadsheetApp {
                                             // Draw the text with clipping to prevent overflow
                                             let text_rect = rect.shrink2(egui::vec2(4.0, 0.0));
                                             let text_pos = rect.left_center() + egui::vec2(4.0, 0.0);
+
+                                            // Use bold font for frozen header row
+                                            let font_id = if is_frozen_header {
+                                                egui::FontId::proportional(14.0)
+                                            } else {
+                                                egui::FontId::default()
+                                            };
+
                                             ui.painter().with_clip_rect(text_rect).text(
                                                 text_pos,
                                                 egui::Align2::LEFT_CENTER,
                                                 &*cell_val,
-                                                egui::FontId::default(),
+                                                font_id,
                                                 ui.visuals().text_color()
                                             );
 
@@ -1557,6 +1757,76 @@ impl eframe::App for SpreadsheetApp {
                         }
                     });
                 });
+        }
+
+        // Search window
+        if self.search_window_open {
+            // Handle Escape key to close search window
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.search_window_open = false;
+            }
+
+            let mut window_open = true;
+            egui::Window::new("Search")
+                .open(&mut window_open)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(400.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Find:");
+                        let response = ui.text_edit_singleline(&mut self.search_query);
+
+                        // Auto-focus the text field when window opens
+                        if self.search_window_open {
+                            response.request_focus();
+                        }
+
+                        // Enter key: search if no results yet, otherwise go to next result
+                        if ui.input(|i| i.key_pressed(egui::Key::Enter)) && response.has_focus() {
+                            if self.search_results.is_empty() {
+                                self.perform_search();
+                            } else {
+                                self.go_to_next_search_result();
+                            }
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.search_case_sensitive, "Case sensitive");
+
+                        if ui.button("Search").clicked() {
+                            self.perform_search();
+                        }
+                    });
+
+                    ui.separator();
+
+                    if !self.search_results.is_empty() {
+                        ui.label(format!(
+                            "Found {} match{} (showing {} of {})",
+                            self.search_results.len(),
+                            if self.search_results.len() == 1 { "" } else { "es" },
+                            self.current_search_result + 1,
+                            self.search_results.len()
+                        ));
+
+                        ui.horizontal(|ui| {
+                            if ui.button("Previous").clicked() {
+                                self.go_to_prev_search_result();
+                            }
+                            if ui.button("Next").clicked() {
+                                self.go_to_next_search_result();
+                            }
+                        });
+                    } else if !self.search_query.is_empty() {
+                        ui.label("No matches found");
+                    }
+                });
+
+            if !window_open {
+                self.search_window_open = false;
+            }
         }
     }
 }

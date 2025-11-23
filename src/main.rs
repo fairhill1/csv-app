@@ -161,7 +161,7 @@ impl SpreadsheetApp {
     }
 
     fn add_row(&mut self) {
-        let cols = self.data.iter().map(|r| r.len()).max().unwrap_or(10);
+        let cols = self.data.first().map(|r| r.len()).unwrap_or(10);
         self.data.push(vec![String::new(); cols]);
     }
 
@@ -176,7 +176,7 @@ impl SpreadsheetApp {
     }
 
     fn insert_row_at(&mut self, row_idx: usize) {
-        let cols = self.data.iter().map(|r| r.len()).max().unwrap_or(10);
+        let cols = self.data.first().map(|r| r.len()).unwrap_or(10);
         self.data.insert(row_idx, vec![String::new(); cols]);
 
         // Adjust editing cell index if after inserted row
@@ -589,7 +589,7 @@ impl eframe::App for SpreadsheetApp {
             let num_cols = self.data.iter().map(|r| r.len()).max().unwrap_or(0);
             let row_height = 25.0;
 
-            // Clone selection for use in closures
+            // Clone selection for use in closures (before any updates)
             let current_selection = self.selection.clone();
 
             // Track pending operations
@@ -597,6 +597,7 @@ impl eframe::App for SpreadsheetApp {
             let mut delete_col: Option<usize> = None;
             let mut insert_row_at: Option<usize> = None;
             let mut insert_col_at: Option<usize> = None;
+            let mut drag_end_cell: Option<(usize, usize)> = None;
 
             let mut table = TableBuilder::new(ui)
                 .striped(true)
@@ -790,13 +791,13 @@ impl eframe::App for SpreadsheetApp {
                                                 self.editing_cell = None;
                                             }
 
-                                            // Update selection immediately during drag
+                                            // Track drag end cell for later update (avoid flicker)
                                             if self.drag_start.is_some() && ui.input(|i| i.pointer.primary_down()) {
                                                 if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                                                    if rect.contains(pos) {
-                                                        if let Some(start) = self.drag_start {
-                                                            self.selection = Selection::CellRange { start, end: cell_id };
-                                                        }
+                                                    // Expand rect to handle edge cases (dividers, fast dragging)
+                                                    let expanded_rect = rect.expand(5.0);
+                                                    if expanded_rect.contains(pos) {
+                                                        drag_end_cell = Some(cell_id);
                                                     }
                                                 }
                                             }
@@ -814,6 +815,20 @@ impl eframe::App for SpreadsheetApp {
                     });
                 });
 
+            // Update selection based on drag AFTER table render
+            if let Some(end_cell) = drag_end_cell {
+                if let Some(start) = self.drag_start {
+                    self.selection = Selection::CellRange { start, end: end_cell };
+                    // Request immediate repaint to show selection update without flicker
+                    ctx.request_repaint();
+                }
+            }
+
+            // Request continuous repaints while dragging for smooth selection updates
+            if self.drag_start.is_some() && ui.input(|i| i.pointer.primary_down()) {
+                ctx.request_repaint();
+            }
+
             // Process pending operations after UI rendering
             if let Some(col_idx) = insert_col_at {
                 self.insert_column_at(col_idx);
@@ -826,11 +841,6 @@ impl eframe::App for SpreadsheetApp {
             }
             if let Some(row_idx) = delete_row {
                 self.delete_row(row_idx);
-            }
-
-            // Request continuous repaints while dragging for smooth selection updates
-            if self.drag_start.is_some() && ui.input(|i| i.pointer.primary_down()) {
-                ctx.request_repaint();
             }
 
             // Clear drag state when mouse released

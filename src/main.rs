@@ -19,7 +19,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "CSV Spreadsheet",
+        "GridView",
         options,
         Box::new(|_cc| Ok(Box::new(SpreadsheetApp::default()))),
     )
@@ -615,68 +615,33 @@ impl eframe::App for SpreadsheetApp {
             });
         });
 
-        // Show confirmation dialog for new file with dimmed background
-        if self.show_new_file_confirm {
-            // Dim the background
-            egui::Area::new("modal_overlay".into())
-                .fixed_pos(egui::pos2(0.0, 0.0))
-                .show(ctx, |ui| {
-                    let screen_rect = ctx.input(|i| {
-                        i.viewport().inner_rect.unwrap_or_else(|| {
-                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(10000.0, 10000.0))
-                        })
-                    });
-                    ui.painter().rect_filled(
-                        screen_rect,
-                        0.0,
-                        egui::Color32::from_black_alpha(128)
-                    );
-                });
-
-            egui::Window::new("Confirm New File")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label("Are you sure you want to create a new file?");
-                    ui.label("All unsaved changes will be lost.");
-                    ui.add_space(10.0);
-
-                    ui.horizontal(|ui| {
-                        if ui.button("Yes, create new file").clicked() {
-                            self.data = vec![vec![String::new(); 10]; 20];
-                            self.file_path = None;
-                            self.show_new_file_confirm = false;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.show_new_file_confirm = false;
-                        }
-                    });
-                });
-        }
-
-        // Only show main UI if modal is not open
-        if !self.show_new_file_confirm {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        // Always render the central panel, but disable interaction when modal is open
+        egui::CentralPanel::default().show(ctx, |ui| {
             let num_rows = self.data.len();
             let num_cols = self.data.iter().map(|r| r.len()).max().unwrap_or(0);
             let row_height = 25.0;
 
-            // Track if we should save current edit when clicking away
-            let mut save_current_edit = false;
-            let previous_editing_cell = self.editing_cell; // Capture BEFORE we change it
+            // Wrap everything in add_enabled_ui to disable interaction when modal is open
+            ui.add_enabled_ui(!self.show_new_file_confirm, |ui| {
+                // Wrap in ScrollArea for horizontal scrolling
+                egui::ScrollArea::both()
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        // Track if we should save current edit when clicking away
+                        let mut save_current_edit = false;
+                        let previous_editing_cell = self.editing_cell; // Capture BEFORE we change it
 
-            // Clone selection for use in closures (before any updates)
-            let current_selection = self.selection.clone();
+                        // Clone selection for use in closures (before any updates)
+                        let current_selection = self.selection.clone();
 
-            // Track pending operations
-            let mut delete_row: Option<usize> = None;
-            let mut delete_col: Option<usize> = None;
-            let mut insert_row_at: Option<usize> = None;
-            let mut insert_col_at: Option<usize> = None;
-            let mut drag_end_cell: Option<(usize, usize)> = None;
+                        // Track pending operations
+                        let mut delete_row: Option<usize> = None;
+                        let mut delete_col: Option<usize> = None;
+                        let mut insert_row_at: Option<usize> = None;
+                        let mut insert_col_at: Option<usize> = None;
+                        let mut drag_end_cell: Option<(usize, usize)> = None;
 
-            let mut table = TableBuilder::new(ui)
+                        let mut table = TableBuilder::new(ui)
                 .id_salt(self.table_id_salt) // Use salt to reset table state
                 .striped(true)
                 .resizable(true)
@@ -970,7 +935,37 @@ impl eframe::App for SpreadsheetApp {
                     };
                 }
             }
+                    }); // End of ScrollArea
+            }); // End of add_enabled_ui
         });
+
+        // Draw modal window
+        if self.show_new_file_confirm {
+            // Check for Escape key to close modal
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.show_new_file_confirm = false;
+            }
+
+            egui::Window::new("Confirm New File")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("Are you sure you want to create a new file?");
+                    ui.label("All unsaved changes will be lost.");
+                    ui.add_space(10.0);
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Yes, create new file").clicked() {
+                            self.data = vec![vec![String::new(); 10]; 20];
+                            self.file_path = None;
+                            self.show_new_file_confirm = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.show_new_file_confirm = false;
+                        }
+                    });
+                });
         }
     }
 }

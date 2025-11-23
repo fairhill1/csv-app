@@ -2,6 +2,9 @@ use eframe::egui;
 use egui_extras::{TableBuilder, Column};
 use std::collections::HashMap;
 use std::path::PathBuf;
+
+// WASM-specific imports
+#[cfg(target_arch = "wasm32")]
 use std::sync::{Arc, Mutex};
 
 // Structure to hold data loaded asynchronously (WASM)
@@ -702,6 +705,36 @@ impl eframe::App for SpreadsheetApp {
                 self.load_csv_from_bytes(&bytes, filename);
             }
         }
+
+        // Handle drag-and-drop files
+        ctx.input(|i| {
+            if !i.raw.dropped_files.is_empty() {
+                for file in &i.raw.dropped_files {
+                    // Native: use path directly
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        if let Some(path) = &file.path {
+                            // Only load CSV files
+                            if path.extension().and_then(|s| s.to_str()) == Some("csv") {
+                                self.load_csv(path.clone());
+                            }
+                        }
+                    }
+
+                    // WASM: use bytes from dropped file
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        if let Some(bytes) = &file.bytes {
+                            let filename = file.name.clone();
+                            // Only load CSV files
+                            if filename.ends_with(".csv") {
+                                self.load_csv_from_bytes(bytes, filename);
+                            }
+                        }
+                    }
+                }
+            }
+        });
 
         // Intercept window close button (X)
         if ctx.input(|i| i.viewport().close_requested()) {

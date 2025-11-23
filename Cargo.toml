@@ -6,5 +6,7 @@ edition = "2024"
 [dependencies]
 eframe = "0.33"
 egui = "0.33"
+egui_extras = "0.33"
 csv = "1.4"
 rfd = "0.15"
+arboard = "3.6"
